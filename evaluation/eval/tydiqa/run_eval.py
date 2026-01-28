@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from types import SimpleNamespace
 
-# === 1. 安全导入 vLLM ===
 try:
     import vllm
 except ImportError:
@@ -47,7 +46,6 @@ def main(args):
     print("Loading data...")
 
     test_data = []
-    # 加载 Dev 数据
     with open(os.path.join(args.data_dir, "tydiqa-goldp-v1.1-dev.json")) as fin:
         dev_data = json.load(fin)
         for article in dev_data["data"]:
@@ -64,7 +62,6 @@ def main(args):
     
     data_languages = set([example["lang"] for example in test_data])
     
-    # 采样测试数据
     if args.max_num_examples_per_lang:
         sampled_examples = []
         for lang in data_languages:
@@ -78,7 +75,6 @@ def main(args):
 
     print(f"Loaded {len(test_data)} examples from {len(data_languages)} languages: {data_languages}")
 
-    # 加载 Few-shot 训练数据
     if args.n_shot > 0:
         train_data_for_langs = {lang: [] for lang in data_languages}
         with open(os.path.join(args.data_dir, "tydiqa-goldp-v1.1-train.json")) as fin:
@@ -98,7 +94,6 @@ def main(args):
                             train_data_for_langs[lang].append(example)
             
             for lang in data_languages:
-                # 确保样本足够
                 if len(train_data_for_langs[lang]) >= args.n_shot:
                     train_data_for_langs[lang] = random.sample(
                         train_data_for_langs[lang], args.n_shot)
@@ -107,11 +102,9 @@ def main(args):
 
     assert all([lang in encoding_templates_with_context.keys() for lang in data_languages])
 
-    # === 模型加载与修复逻辑 ===
     if args.model_name_or_path:
         print("Loading model and tokenizer...")
         
-        # 1. vLLM 加载
         if args.use_vllm:
             if vllm is None:
                 raise ImportError("vllm is not installed but --use_vllm was requested.")
@@ -126,10 +119,8 @@ def main(args):
                 trust_remote_code=True,
                 gpu_memory_utilization=0.9,
             )
-            # vLLM 的 tokenizer 是被封装的
             tokenizer = model.llm_engine.tokenizer.tokenizer if hasattr(model.llm_engine.tokenizer, 'tokenizer') else model.get_tokenizer()
         
-        # 2. HuggingFace 加载
         else:
             model, tokenizer = load_hf_lm_and_tokenizer(
                 model_name_or_path=args.model_name_or_path,
@@ -142,12 +133,9 @@ def main(args):
                 convert_to_half=args.convert_to_half,
             )
 
-        # === 终极修复：强制同步 Tokenizer 到 Model Config ===
         print(f"[DEBUG] Original Tokenizer EOS: {tokenizer.eos_token}, ID: {tokenizer.eos_token_id}")
         
-        # A. 确保 Tokenizer 知道 EOS 是谁
         if tokenizer.eos_token_id is None:
-            # Llama 3 检测
             try:
                 test_id = tokenizer.convert_tokens_to_ids("<|end_of_text|>")
                 if isinstance(test_id, int) and test_id != tokenizer.unk_token_id:
@@ -157,7 +145,6 @@ def main(args):
             except:
                 pass
             
-            # Qwen 检测
             if tokenizer.eos_token_id is None:
                 for candidate in ["<|im_end|>", "<|endoftext|>"]:
                     try:
@@ -169,7 +156,6 @@ def main(args):
                     except:
                         pass
         
-        # B. 确保 Tokenizer 知道 Pad 是谁
         if tokenizer.pad_token_id is None:
             if tokenizer.eos_token_id is not None:
                 tokenizer.pad_token = tokenizer.eos_token
@@ -178,29 +164,22 @@ def main(args):
                 tokenizer.pad_token_id = 0 
             print(f"[Fixing] Set Tokenizer PAD ID to: {tokenizer.pad_token_id}")
 
-        # C. 【关键步骤】强制覆盖 Model Config 和 Generation Config
-        # 你的报错就是因为这里没覆盖上！
         if not args.use_vllm:
             model.config.eos_token_id = tokenizer.eos_token_id
             model.config.pad_token_id = tokenizer.pad_token_id
             
-            # Llama 3 特别需要这一步：
             if hasattr(model, "generation_config"):
                 model.generation_config.eos_token_id = tokenizer.eos_token_id
                 model.generation_config.pad_token_id = tokenizer.pad_token_id
             
             print(f"[Fixed] Model Config EOS ID: {model.config.eos_token_id}")
             print(f"[Fixed] Model Config PAD ID: {model.config.pad_token_id}")
-        # ====================================================
-
     else:
         import tiktoken
         tokenizer = tiktoken.get_encoding("cl100k_base")
 
-    # 截断 Context 长度
     if args.max_context_length:
         for example in test_data:
-            # 兼容不同的 tokenizer 调用方式
             if hasattr(tokenizer, "encode"):
                 tokenized_context = tokenizer.encode(example["context"])
             else:
@@ -225,7 +204,6 @@ def main(args):
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir, exist_ok=True)
 
-    # === 构建 Prompt ===
     prompts = []
     chat_formatting_function = dynamic_import_function(
         args.chat_formatting_function) if args.use_chat_format else None
@@ -275,8 +253,6 @@ def main(args):
             prompt += a_template
         prompts.append(prompt)
 
-    # === 生成逻辑 (含 Stop Tokens) ===
-    # 增加 Llama 3 的 <|eot_id|>
     stop_tokens = ["\n", "\n\n", "Question:", "Answer:", "<|end_of_text|>", "<|im_end|>", "<|eot_id|>"]
     
     if args.model_name_or_path:
@@ -324,21 +300,17 @@ def main(args):
         )
         outputs = [result["output"] for result in results]
 
-    # === 强力后处理 (清洗) ===
     cleaned_outputs = []
     for output in outputs:
         prediction = output.strip()
-        # 1. 截断换行
         if "\n" in prediction:
             prediction = prediction.split("\n")[0].strip()
-        # 2. 去除可能复读的 "Answer:"
         if "Answer:" in prediction:
             prediction = prediction.split("Answer:")[-1].strip()
         cleaned_outputs.append(prediction)
     
     outputs = cleaned_outputs
 
-    # 保存预测结果
     with open(os.path.join(args.save_dir, "tydiaqa_predictions.jsonl"), "w") as fout:
         for example, output in zip(test_data, outputs):
             example["prediction_text"] = output
@@ -349,11 +321,9 @@ def main(args):
 
     eval_scores = {}
     for lang in data_languages:
-        # 1. 预测列表
         lang_predictions = [{"id": example["id"], "prediction_text": output}
                             for example, output in zip(test_data, outputs) if example["lang"] == lang]
         
-        # 2. 答案引用列表 (转换格式)
         lang_references = []
         for example in test_data:
             if example["lang"] == lang:
@@ -366,14 +336,12 @@ def main(args):
                     "answers": formatted_answers
                 })
 
-        # 3. 计算分数
         if len(lang_predictions) > 0:
             eval_scores[lang] = metric.compute(
                 predictions=lang_predictions, references=lang_references)
         else:
              eval_scores[lang] = {"exact_match": 0.0, "f1": 0.0}
 
-    # 计算平均分
     if len(eval_scores) > 0:
         eval_scores["average"] = {metric: np.mean(
             [scores[metric] for scores in eval_scores.values()]) for metric in ["f1", "exact_match"]}

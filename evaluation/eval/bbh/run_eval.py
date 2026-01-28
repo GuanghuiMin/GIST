@@ -8,7 +8,6 @@ import evaluate
 import torch
 import tqdm
 
-# === 1. 安全导入 vLLM ===
 try:
     import vllm
 except ImportError:
@@ -57,7 +56,6 @@ def main(args):
     # === 修复 1: 路径修正，直接在 data_dir 下找 json ===
     task_files = glob.glob(os.path.join(args.data_dir, "*.json"))
     
-    # 如果没找到，尝试在子目录找（兼容旧逻辑）
     if not task_files:
         task_files = glob.glob(os.path.join(args.data_dir, "bbh", "*.json"))
 
@@ -67,7 +65,6 @@ def main(args):
             try:
                 raw_data = json.load(f)
                 
-                # === 修复 2: 自适应数据格式 (解决 KeyError: 'examples') ===
                 if isinstance(raw_data, dict) and "examples" in raw_data:
                     examples = raw_data["examples"]
                 elif isinstance(raw_data, list):
@@ -75,7 +72,6 @@ def main(args):
                 elif isinstance(raw_data, dict) and "data" in raw_data: # HuggingFace format
                     examples = raw_data["data"]
                 else:
-                    # 最后的尝试：假设整个 dict 就是一条数据，或者格式不匹配
                     print(f"[Warning] Could not find list in {task_file}, skipping.")
                     continue
 
@@ -92,7 +88,6 @@ def main(args):
 
     all_prompts = {}
     cot_prompt_files = glob.glob(os.path.join(args.data_dir, "cot-prompts", "*.txt"))
-    # 如果没找到，尝试向上找一级（兼容性）
     if not cot_prompt_files:
          cot_prompt_files = glob.glob(os.path.join(args.data_dir, "../cot-prompts", "*.txt"))
 
@@ -116,7 +111,6 @@ def main(args):
                 task_prompt = "\n\n".join(new_prompt_fields)
             all_prompts[task_name] = task_prompt
 
-    # === 修复 4: 交集逻辑 (解决 No common tasks found) ===
     task_keys = set(all_tasks.keys())
     prompt_keys = set(all_prompts.keys())
     common_keys = task_keys.intersection(prompt_keys)
@@ -148,8 +142,8 @@ def main(args):
                 tokenizer_mode="slow" if args.use_slow_tokenizer else "auto",
                 tensor_parallel_size=torch.cuda.device_count(),
                 max_num_batched_tokens=4096,
-                trust_remote_code=True, # 建议加上
-                gpu_memory_utilization=0.9, # 防止 OOM
+                trust_remote_code=True, 
+                gpu_memory_utilization=0.9,
             )
             tokenizer = model.llm_engine.tokenizer.tokenizer if hasattr(model.llm_engine.tokenizer, 'tokenizer') else model.get_tokenizer()
         else:
@@ -165,10 +159,8 @@ def main(args):
                 convert_to_half=args.convert_to_half,
             )
 
-        # === 修复 5: Llama-3 / Qwen 万能补丁 (解决无限生成/速度慢) ===
         print(f"[DEBUG] Original Tokenizer EOS: {tokenizer.eos_token}, ID: {tokenizer.eos_token_id}")
         
-        # 自动修复 EOS
         if tokenizer.eos_token_id is None:
             # Llama 3
             try:
@@ -190,7 +182,6 @@ def main(args):
                             break
                     except: pass
 
-        # 自动修复 Pad
         if tokenizer.pad_token_id is None:
             if tokenizer.eos_token_id is not None:
                 tokenizer.pad_token = tokenizer.eos_token
@@ -199,7 +190,6 @@ def main(args):
                 tokenizer.pad_token_id = 0
             print(f"  -> Set PAD Token ID to {tokenizer.pad_token_id}")
 
-        # 强制同步 Config (HF 生成必须)
         if not args.use_vllm:
             model.config.eos_token_id = tokenizer.eos_token_id
             model.config.pad_token_id = tokenizer.pad_token_id
@@ -216,7 +206,6 @@ def main(args):
     else:
         tasks = all_tasks.keys()
 
-    # === 修复 6: 增强 Stop Tokens ===
     stop_tokens = ["\n\n", "Question:", "Q:", "<|end_of_text|>", "<|im_end|>", "<|eot_id|>"]
 
     for task_name in tqdm.tqdm(tasks, desc="Evaluating"):
@@ -245,7 +234,7 @@ def main(args):
                 sampling_params = vllm.SamplingParams(
                     temperature=0,
                     max_tokens=512,
-                    stop=stop_tokens, # 使用增强的 stop tokens
+                    stop=stop_tokens,
                 )
                 generations = model.generate(prompts, sampling_params)
                 prompt_to_output = {
@@ -262,7 +251,6 @@ def main(args):
                         if len(ids) > 0: stop_id_sequences.append(ids)
                     except: pass
                 
-                # 特别增加 new line 的检测
                 nl_token = tokenizer.encode("\n", add_special_tokens=False)[-1]
                 stop_id_sequences.append([nl_token, nl_token]) # \n\n
 
@@ -276,7 +264,6 @@ def main(args):
                     stop_id_sequences=stop_id_sequences
                 )
         else:
-            # OpenAI logic (unchanged)
             instances = []
             for i, example in enumerate(task_examples):
                 prompt = task_prompt.strip() + "\n\nQ: " + \
