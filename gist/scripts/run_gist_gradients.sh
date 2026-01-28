@@ -8,10 +8,7 @@ DATA_DIR="./data"
 MODEL_PATH="../out/llama3.2-3b-p0.05-lora-seed3/checkpoint-${CKPT}"
 OUTPUT_DIR="../gist_results/grads/llama3.2/${CKPT}/${TASK}"
 
-export PYTHONPATH=$PYTHONPATH:.
-export CUDA_VISIBLE_DEVICES=4
 
-echo "Logging to file: run_end2end_${TASK}_${CKPT}.log"
 python3 gist/get_gist_gradients.py \
     --task $TASK \
     --train_files $TRAIN_FILES \
