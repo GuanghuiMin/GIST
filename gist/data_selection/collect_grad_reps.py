@@ -88,12 +88,9 @@ def get_number_of_params(model):
 
 
 def obtain_gradients(model, batch):
-    # 1. 确保模型处于评估模式并清空梯度
     model.eval()
     model.zero_grad()
 
-    # 2. 前向传播
-    # 这里的 device 获取方式取决于你的 batch 数据位置，通常取 input_ids 的 device 即可
     target_device = batch["input_ids"].device 
     
     input_ids = batch["input_ids"].to(model.device)
@@ -110,32 +107,19 @@ def obtain_gradients(model, batch):
     loss = outputs.loss
     loss.backward()
 
-    # 3. 收集梯度
     grads = []
-    
-    # === 关键修复：确定一个统一的目标设备 ===
-    # 我们统一把梯度搬运到 input_ids 所在的设备（通常是 cuda:0）
-    # 或者直接写 target_device = torch.device("cuda:0")
+
     
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
-            # === 关键修复：强制移动到 target_device ===
             g = param.grad.data.to(target_device, non_blocking=True)
             grads.append(g.view(-1))
 
-    # 4. 拼接
     if len(grads) == 0:
         return None
         
     return torch.cat(grads)
 
-# def obtain_gradients(model, batch):
-#     """ obtain gradients. """
-#     loss = model(**batch).loss
-#     loss.backward()
-#     vectorized_grads = torch.cat(
-#         [p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-#     return vectorized_grads
 
 
 def obtain_sign_gradients(model, batch):
@@ -151,13 +135,10 @@ def obtain_sign_gradients(model, batch):
 
 
 def obtain_gradients_with_adam(model, batch, m, v):
-    # 1. 确保模型处于训练模式并清空梯度
-    model.eval() # 或者是 model.train()，取决于你的逻辑，通常提取特征时用 eval 或 train 皆可，但要能反向传播
+    model.eval()
     model.zero_grad()
 
-    # 2. 前向传播和反向传播
-    # 注意：根据你的具体代码，这里可能需要调整 inputs 的解包方式
-    # LESS 默认通常是这样：
+
     input_ids = batch["input_ids"].to(model.device)
     attention_mask = batch["attention_mask"].to(model.device)
     labels = batch["labels"].to(model.device)
@@ -172,128 +153,85 @@ def obtain_gradients_with_adam(model, batch, m, v):
     loss = outputs.loss
     loss.backward()
 
-    # 3. 收集并缩放梯度
     grads = []
     start_idx = 0
     
-    # 获取目标设备（以 m 所在的设备为准，通常是 cuda:0）
     target_device = m.device
 
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
-            # 计算参数数量，用于从 m/v 中切片
             num_params = param.numel()
             end_idx = start_idx + num_params
 
-            # 获取对应的优化器状态切片 (这些已经在 target_device 上了)
             m_slice = m[start_idx:end_idx].view(param.shape)
             v_slice = v[start_idx:end_idx].view(param.shape)
 
-            # === 关键修复 ===
-            # 将参数的梯度强制移动到 target_device
+
             g = param.grad.data.to(target_device, non_blocking=True)
             
-            # 执行 Adam 缩放: g_new = g / (sqrt(v) + eps)
-            # 这里的 eps 设为 1e-8，与 Adam 默认值一致
             scaled_grad = g / (torch.sqrt(v_slice) + 1e-8)
 
             grads.append(scaled_grad.view(-1))
             start_idx = end_idx
 
-    # 4. 拼接
     if len(grads) == 0:
         return None
         
     return torch.cat(grads)
 
-# def obtain_gradients_with_adam(model, batch, avg, avg_sq):
-#     """ obtain gradients with adam optimizer states. """
-#     beta1 = 0.9
-#     beta2 = 0.999
-#     eps = 1e-08
-
-#     loss = model(**batch).loss
-#     loss.backward()
-
-#     vectorized_grads = torch.cat(
-#         [p.grad.view(-1) for n, p in model.named_parameters() if p.grad is not None])
-
-#     updated_avg = beta1 * avg + (1 - beta1) * vectorized_grads
-#     updated_avg_sq = beta2 * avg_sq + (1 - beta2) * vectorized_grads ** 2
-#     vectorized_grads = updated_avg / torch.sqrt(updated_avg_sq + eps)
-
-#     return vectorized_grads
 
 def prepare_optimizer_state(model, optimizer_state, device):
-    # 1. 获取模型中所有需要梯度的参数名（顺序很重要，通常与优化器里的顺序一致）
     names = [n for n, p in model.named_parameters() if p.requires_grad]
     
-    # 2. 检查 optimizer_state 的键是整数还是字符串
-    # 注意：optimizer_state 有时包含 'state' 键，有时就是 state 本身，视加载方式而定
+
     if "state" in optimizer_state and isinstance(optimizer_state, dict):
-         # 如果加载的是完整的 state_dict，提取真正的 state 部分
         real_state_dict = optimizer_state["state"]
     else:
         real_state_dict = optimizer_state
 
     keys = list(real_state_dict.keys())
     
-    # 3. 构建映射逻辑
     name_to_state_map = {}
     
     if len(keys) > 0 and isinstance(keys[0], int):
-        # === 情况 A: 优化器用的是整数 ID (标准 PyTorch) ===
         print(f"[Info] Optimizer keys are integers. Mapping by order...")
         print(f"Num trainable params: {len(names)}, Num optimizer keys: {len(keys)}")
         
-        # 排序整数键，确保顺序对齐
         sorted_keys = sorted(keys)
         
-        # 安全检查：如果数量不一致，强行映射可能会错位，但通常 LoRA 训练是一致的
         if len(names) != len(sorted_keys):
             print(f"[Warning] Mismatch in count! Model has {len(names)} trainable params, "
                   f"but optimizer has {len(sorted_keys)} states. "
                   "Mapping might be incorrect if some params were skipped.")
             
-            # 尝试只映射前 N 个（死马当活马医，通常能解决问题）
             limit = min(len(names), len(sorted_keys))
             for i in range(limit):
                 name_to_state_map[names[i]] = real_state_dict[sorted_keys[i]]
         else:
-            # 完美匹配
             for i, name in enumerate(names):
                 name_to_state_map[name] = real_state_dict[sorted_keys[i]]
                 
     else:
-        # === 情况 B: 优化器用的是参数名 (FSDP 或 处理过的 checkpoint) ===
-        # 使用之前的智能匹配逻辑
         print(f"[Info] Optimizer keys are strings. Using name matching...")
         for key, value in real_state_dict.items():
-            # 1. 原始 key
             name_to_state_map[key] = value
-            # 2. 去掉 base_model 前缀的 key
             clean_key = key.replace("base_model.model.model.", "base_model.model.")
             name_to_state_map[clean_key] = value
             clean_key_2 = key.replace("base_model.model.", "")
             name_to_state_map[clean_key_2] = value
 
-    # 4. 提取最终需要的 Tensor
     avg_list = []
     avg_sq_list = []
     
     for n in names:
-        # 尝试获取 state
         state = name_to_state_map.get(n)
         
-        # 如果还是没找到，尝试最后一种模糊匹配（针对 String key 情况的漏网之鱼）
         if state is None:
-             # 再次尝试常见的 LoRA 前缀差异
             if n.startswith("base_model.model."):
                 short_n = n.replace("base_model.model.", "")
                 state = name_to_state_map.get(short_n)
                 
         if state is None:
-            # 打印详细报错帮助 Debug
             print(f"\n[Error] Parameter '{n}' not found in optimizer state.")
             if isinstance(keys[0], int):
                  print("Reason: Integer mapping failed. Count mismatch?")
@@ -301,11 +239,8 @@ def prepare_optimizer_state(model, optimizer_state, device):
                  print(f"Available string keys sample: {keys[:5]}")
             raise KeyError(f"Parameter '{n}' missing.")
             
-        # 这里的 state 应该是一个包含 exp_avg 的字典
         if "exp_avg" not in state:
-             # 有时候 state 是空的或者格式不对
              print(f"[Warning] State for {n} does not contain 'exp_avg'. Initializing with zeros.")
-             # 获取对应参数的形状
              param_shape = dict(model.named_parameters())[n].shape
              avg_list.append(torch.zeros(param_shape, device=device).view(-1))
              avg_sq_list.append(torch.zeros(param_shape, device=device).view(-1))
@@ -315,14 +250,6 @@ def prepare_optimizer_state(model, optimizer_state, device):
 
     return torch.cat(avg_list), torch.cat(avg_sq_list)
 
-# def prepare_optimizer_state(model, optimizer_state, device):
-#     names = [n for n, p in model.named_parameters() if p.requires_grad]
-#     avg = torch.cat([optimizer_state[n]["exp_avg"].view(-1) for n in names])
-#     avg_sq = torch.cat([optimizer_state[n]["exp_avg_sq"].view(-1)
-#                        for n in names])
-#     avg = avg.to(device)
-#     avg_sq = avg_sq.to(device)
-#     return avg, avg_sq
 
 
 def collect_grads(dataloader,

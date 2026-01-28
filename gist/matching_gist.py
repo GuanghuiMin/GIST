@@ -11,7 +11,6 @@ TASK_CONFIG = {
 }
 
 def parse_args():
-    # [Restored] Description changed to Cosine Similarity
     parser = argparse.ArgumentParser(description='Cosine Similarity Matching (Normalized Gradients)')
     parser.add_argument('--output_path', type=str, default="selected_data_cosine", help='Output dir')
     parser.add_argument('--gist_path_template', type=str, required=True)
