@@ -1,0 +1,594 @@
+import json
+import os
+from hashlib import md5
+from typing import Iterable, List, Optional
+
+import torch
+import torch.nn.functional as F
+from functorch import grad, make_functional_with_buffers, vmap
+from peft import PeftModel
+from torch import Tensor
+from torch.nn.functional import normalize
+from tqdm import tqdm
+from trak.projectors import BasicProjector, CudaProjector, ProjectionType
+from transformers import RobertaModel
+
+
+def prepare_batch(batch, device=torch.device("cuda:0")):
+    """ Move the batch to the device. """
+    for key in batch:
+        batch[key] = batch[key].to(device)
+
+
+def get_max_saved_index(output_dir: str, prefix="reps") -> int:
+    """ 
+    Retrieve the highest index for which the data (either representation or gradients) has been stored. 
+
+    Args:
+        output_dir (str): The output directory.
+        prefix (str, optional): The prefix of the files, [reps | grads]. Defaults to "reps".
+
+    Returns:
+        int: The maximum representation index, or -1 if no index is found.
+    """
+
+    files = [file for file in os.listdir(
+        output_dir) if file.startswith(prefix)]
+    index = [int(file.split(".")[0].split("-")[1])
+             for file in files]  # e.g., output_dir/reps-100.pt
+    return max(index) if len(index) > 0 else -1
+
+
+def get_output(model,
+               weights: Iterable[Tensor],
+               buffers: Iterable[Tensor],
+               input_ids=None,
+               attention_mask=None,
+               labels=None,
+               ) -> Tensor:
+    logits = model(weights, buffers, *(input_ids.unsqueeze(0),
+                   attention_mask.unsqueeze(0))).logits
+    labels = labels.unsqueeze(0)
+    loss_fct = F.cross_entropy
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss = loss_fct(
+        shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1))
+    return loss
+
+
+def get_trak_projector(device: torch.device):
+    """ Get trak projectors (see https://github.com/MadryLab/trak for details) """
+    try:
+        num_sms = torch.cuda.get_device_properties(
+            device.index).multi_processor_count
+        import fast_jl
+
+        # test run to catch at init time if projection goes through
+        fast_jl.project_rademacher_8(torch.zeros(
+            8, 1_000, device=device), 512, 0, num_sms)
+        projector = CudaProjector
+        print("Using CudaProjector")
+    except:
+        projector = BasicProjector
+        print("Using BasicProjector")
+    return projector
+
+
+def get_number_of_params(model):
+    """ Make sure that only lora parameters require gradients in peft models. """
+    if isinstance(model, PeftModel):
+        names = [n for n, p in model.named_parameters(
+        ) if p.requires_grad and "lora" not in n]
+        assert len(names) == 0
+    num_params = sum([p.numel()
+                     for p in model.parameters() if p.requires_grad])
+    print(f"Total number of parameters that require gradients: {num_params}")
+    return num_params
+
+
+def obtain_gradients(model, batch):
+    # 1. 确保模型处于评估模式并清空梯度
+    model.eval()
+    model.zero_grad()
+
+    # 2. 前向传播
+    # 这里的 device 获取方式取决于你的 batch 数据位置，通常取 input_ids 的 device 即可
+    target_device = batch["input_ids"].device 
+    
+    input_ids = batch["input_ids"].to(model.device)
+    attention_mask = batch["attention_mask"].to(model.device)
+    labels = batch["labels"].to(model.device)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_cache=False
+    )
+    
+    loss = outputs.loss
+    loss.backward()
+
+    # 3. 收集梯度
+    grads = []
+    
+    # === 关键修复：确定一个统一的目标设备 ===
+    # 我们统一把梯度搬运到 input_ids 所在的设备（通常是 cuda:0）
+    # 或者直接写 target_device = torch.device("cuda:0")
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            # === 关键修复：强制移动到 target_device ===
+            g = param.grad.data.to(target_device, non_blocking=True)
+            grads.append(g.view(-1))
+
+    # 4. 拼接
+    if len(grads) == 0:
+        return None
+        
+    return torch.cat(grads)
+
+# def obtain_gradients(model, batch):
+#     """ obtain gradients. """
+#     loss = model(**batch).loss
+#     loss.backward()
+#     vectorized_grads = torch.cat(
+#         [p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+#     return vectorized_grads
+
+
+def obtain_sign_gradients(model, batch):
+    """ obtain gradients with sign. """
+    loss = model(**batch).loss
+    loss.backward()
+
+    # Instead of concatenating the gradients, concatenate their signs
+    vectorized_grad_signs = torch.cat(
+        [torch.sign(p.grad).view(-1) for p in model.parameters() if p.grad is not None])
+
+    return vectorized_grad_signs
+
+
+def obtain_gradients_with_adam(model, batch, m, v):
+    # 1. 确保模型处于训练模式并清空梯度
+    model.eval() # 或者是 model.train()，取决于你的逻辑，通常提取特征时用 eval 或 train 皆可，但要能反向传播
+    model.zero_grad()
+
+    # 2. 前向传播和反向传播
+    # 注意：根据你的具体代码，这里可能需要调整 inputs 的解包方式
+    # LESS 默认通常是这样：
+    input_ids = batch["input_ids"].to(model.device)
+    attention_mask = batch["attention_mask"].to(model.device)
+    labels = batch["labels"].to(model.device)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_cache=False 
+    )
+    
+    loss = outputs.loss
+    loss.backward()
+
+    # 3. 收集并缩放梯度
+    grads = []
+    start_idx = 0
+    
+    # 获取目标设备（以 m 所在的设备为准，通常是 cuda:0）
+    target_device = m.device
+
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            # 计算参数数量，用于从 m/v 中切片
+            num_params = param.numel()
+            end_idx = start_idx + num_params
+
+            # 获取对应的优化器状态切片 (这些已经在 target_device 上了)
+            m_slice = m[start_idx:end_idx].view(param.shape)
+            v_slice = v[start_idx:end_idx].view(param.shape)
+
+            # === 关键修复 ===
+            # 将参数的梯度强制移动到 target_device
+            g = param.grad.data.to(target_device, non_blocking=True)
+            
+            # 执行 Adam 缩放: g_new = g / (sqrt(v) + eps)
+            # 这里的 eps 设为 1e-8，与 Adam 默认值一致
+            scaled_grad = g / (torch.sqrt(v_slice) + 1e-8)
+
+            grads.append(scaled_grad.view(-1))
+            start_idx = end_idx
+
+    # 4. 拼接
+    if len(grads) == 0:
+        return None
+        
+    return torch.cat(grads)
+
+# def obtain_gradients_with_adam(model, batch, avg, avg_sq):
+#     """ obtain gradients with adam optimizer states. """
+#     beta1 = 0.9
+#     beta2 = 0.999
+#     eps = 1e-08
+
+#     loss = model(**batch).loss
+#     loss.backward()
+
+#     vectorized_grads = torch.cat(
+#         [p.grad.view(-1) for n, p in model.named_parameters() if p.grad is not None])
+
+#     updated_avg = beta1 * avg + (1 - beta1) * vectorized_grads
+#     updated_avg_sq = beta2 * avg_sq + (1 - beta2) * vectorized_grads ** 2
+#     vectorized_grads = updated_avg / torch.sqrt(updated_avg_sq + eps)
+
+#     return vectorized_grads
+
+def prepare_optimizer_state(model, optimizer_state, device):
+    # 1. 获取模型中所有需要梯度的参数名（顺序很重要，通常与优化器里的顺序一致）
+    names = [n for n, p in model.named_parameters() if p.requires_grad]
+    
+    # 2. 检查 optimizer_state 的键是整数还是字符串
+    # 注意：optimizer_state 有时包含 'state' 键，有时就是 state 本身，视加载方式而定
+    if "state" in optimizer_state and isinstance(optimizer_state, dict):
+         # 如果加载的是完整的 state_dict，提取真正的 state 部分
+        real_state_dict = optimizer_state["state"]
+    else:
+        real_state_dict = optimizer_state
+
+    keys = list(real_state_dict.keys())
+    
+    # 3. 构建映射逻辑
+    name_to_state_map = {}
+    
+    if len(keys) > 0 and isinstance(keys[0], int):
+        # === 情况 A: 优化器用的是整数 ID (标准 PyTorch) ===
+        print(f"[Info] Optimizer keys are integers. Mapping by order...")
+        print(f"Num trainable params: {len(names)}, Num optimizer keys: {len(keys)}")
+        
+        # 排序整数键，确保顺序对齐
+        sorted_keys = sorted(keys)
+        
+        # 安全检查：如果数量不一致，强行映射可能会错位，但通常 LoRA 训练是一致的
+        if len(names) != len(sorted_keys):
+            print(f"[Warning] Mismatch in count! Model has {len(names)} trainable params, "
+                  f"but optimizer has {len(sorted_keys)} states. "
+                  "Mapping might be incorrect if some params were skipped.")
+            
+            # 尝试只映射前 N 个（死马当活马医，通常能解决问题）
+            limit = min(len(names), len(sorted_keys))
+            for i in range(limit):
+                name_to_state_map[names[i]] = real_state_dict[sorted_keys[i]]
+        else:
+            # 完美匹配
+            for i, name in enumerate(names):
+                name_to_state_map[name] = real_state_dict[sorted_keys[i]]
+                
+    else:
+        # === 情况 B: 优化器用的是参数名 (FSDP 或 处理过的 checkpoint) ===
+        # 使用之前的智能匹配逻辑
+        print(f"[Info] Optimizer keys are strings. Using name matching...")
+        for key, value in real_state_dict.items():
+            # 1. 原始 key
+            name_to_state_map[key] = value
+            # 2. 去掉 base_model 前缀的 key
+            clean_key = key.replace("base_model.model.model.", "base_model.model.")
+            name_to_state_map[clean_key] = value
+            clean_key_2 = key.replace("base_model.model.", "")
+            name_to_state_map[clean_key_2] = value
+
+    # 4. 提取最终需要的 Tensor
+    avg_list = []
+    avg_sq_list = []
+    
+    for n in names:
+        # 尝试获取 state
+        state = name_to_state_map.get(n)
+        
+        # 如果还是没找到，尝试最后一种模糊匹配（针对 String key 情况的漏网之鱼）
+        if state is None:
+             # 再次尝试常见的 LoRA 前缀差异
+            if n.startswith("base_model.model."):
+                short_n = n.replace("base_model.model.", "")
+                state = name_to_state_map.get(short_n)
+                
+        if state is None:
+            # 打印详细报错帮助 Debug
+            print(f"\n[Error] Parameter '{n}' not found in optimizer state.")
+            if isinstance(keys[0], int):
+                 print("Reason: Integer mapping failed. Count mismatch?")
+            else:
+                 print(f"Available string keys sample: {keys[:5]}")
+            raise KeyError(f"Parameter '{n}' missing.")
+            
+        # 这里的 state 应该是一个包含 exp_avg 的字典
+        if "exp_avg" not in state:
+             # 有时候 state 是空的或者格式不对
+             print(f"[Warning] State for {n} does not contain 'exp_avg'. Initializing with zeros.")
+             # 获取对应参数的形状
+             param_shape = dict(model.named_parameters())[n].shape
+             avg_list.append(torch.zeros(param_shape, device=device).view(-1))
+             avg_sq_list.append(torch.zeros(param_shape, device=device).view(-1))
+        else:
+            avg_list.append(state["exp_avg"].to(device).view(-1))
+            avg_sq_list.append(state["exp_avg_sq"].to(device).view(-1))
+
+    return torch.cat(avg_list), torch.cat(avg_sq_list)
+
+# def prepare_optimizer_state(model, optimizer_state, device):
+#     names = [n for n, p in model.named_parameters() if p.requires_grad]
+#     avg = torch.cat([optimizer_state[n]["exp_avg"].view(-1) for n in names])
+#     avg_sq = torch.cat([optimizer_state[n]["exp_avg_sq"].view(-1)
+#                        for n in names])
+#     avg = avg.to(device)
+#     avg_sq = avg_sq.to(device)
+#     return avg, avg_sq
+
+
+def collect_grads(dataloader,
+                  model,
+                  output_dir,
+                  proj_dim: List[int] = [8192],
+                  adam_optimizer_state: Optional[dict] = None,
+                  gradient_type: str = "adam",
+                  max_samples: Optional[int] = None):
+    """
+    Collects gradients from the model during evaluation and saves them to disk.
+
+    Args:
+        dataloader (torch.utils.data.DataLoader): The data loader for evaluation dataset.
+        model (torch.nn.Module): The model from which gradients will be collected.
+        output_dir (str): The directory where the gradients will be saved.
+        proj_dim List[int]: The dimensions of the target projectors. Each dimension will be saved in a separate folder.
+        gradient_type (str): The type of gradients to collect. [adam | sign | sgd]
+        adam_optimizer_state (dict): The optimizer state of adam optimizers. If None, the gradients will be collected without considering Adam optimization states. 
+        max_samples (int, optional): The maximum number of samples to collect. Defaults to None.
+    """
+
+    model_id = 0  # model_id is used to draft the random seed for the projectors
+    block_size = 128  # fixed block size for the projectors
+    projector_batch_size = 16  # batch size for the projectors
+    torch.random.manual_seed(0)  # set the random seed for torch
+
+    project_interval = 16  # project every 16 batches
+    save_interval = 160  # save every 160 batches
+
+    def _project(current_full_grads, projected_grads):
+        current_full_grads = torch.stack(current_full_grads).to(torch.float16)
+        for i, projector in enumerate(projectors):
+            current_projected_grads = projector.project(
+                current_full_grads, model_id=model_id)
+            projected_grads[proj_dim[i]].append(current_projected_grads.cpu())
+
+    def _save(projected_grads, output_dirs):
+        for dim in proj_dim:
+            if len(projected_grads[dim]) == 0:
+                continue
+            projected_grads[dim] = torch.cat(projected_grads[dim])
+
+            output_dir = output_dirs[dim]
+            outfile = os.path.join(output_dir, f"grads-{count}.pt")
+            torch.save(projected_grads[dim], outfile)
+            print(
+                f"Saving {outfile}, {projected_grads[dim].shape}", flush=True)
+            projected_grads[dim] = []
+
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+
+    # prepare optimization states
+    if gradient_type == "adam":
+        assert adam_optimizer_state is not None
+        # first and second moment estimates
+        m, v = prepare_optimizer_state(model, adam_optimizer_state, device)
+
+    projector = get_trak_projector(device)
+    number_of_params = get_number_of_params(model)
+
+    # never made it work sadly
+    # fmodel, params, buffers = make_functional_with_buffers(model)
+    # grads_loss = torch.func.grad(get_output, has_aux=False, argnums=1)
+
+    # initialize a project for each target projector dimension
+    projectors = []
+    for dim in proj_dim:
+        proj = projector(grad_dim=number_of_params,
+                         proj_dim=dim,
+                         seed=0,
+                         proj_type=ProjectionType.rademacher,
+                         device=device,
+                         dtype=dtype,
+                         block_size=block_size,
+                         max_batch_size=projector_batch_size)
+        projectors.append(proj)
+
+    count = 0
+
+    # set up a output directory for each dimension
+    output_dirs = {}
+    for dim in proj_dim:
+        output_dir_per_dim = os.path.join(output_dir, f"dim{dim}")
+        output_dirs[dim] = output_dir_per_dim
+        os.makedirs(output_dir_per_dim, exist_ok=True)
+
+    # max index for each dimension
+    max_index = min(get_max_saved_index(
+        output_dirs[dim], "grads") for dim in proj_dim)
+
+    # projected_gradients
+    full_grads = []  # full gradients
+    projected_grads = {dim: [] for dim in proj_dim}  # projected gradients
+
+    for batch in tqdm(dataloader, total=len(dataloader)):
+        prepare_batch(batch)
+        count += 1
+
+        if count <= max_index:
+            print("skipping count", count)
+            continue
+
+        if gradient_type == "adam":
+            if count == 1:
+                print("Using Adam gradients")
+            vectorized_grads = obtain_gradients_with_adam(model, batch, m, v)
+        elif gradient_type == "sign":
+            if count == 1:
+                print("Using Sign gradients")
+            vectorized_grads = obtain_sign_gradients(model, batch)
+        else:
+            if count == 1:
+                print("Using SGD gradients")
+            vectorized_grads = obtain_gradients(model, batch)
+
+        # add the gradients to the full_grads
+        full_grads.append(vectorized_grads)
+        model.zero_grad()
+
+        if count % project_interval == 0:
+            _project(full_grads, projected_grads)
+            full_grads = []
+
+        if count % save_interval == 0:
+            _save(projected_grads, output_dirs)
+
+        if max_samples is not None and count == max_samples:
+            break
+
+    if len(full_grads) > 0:
+        _project(full_grads, projected_grads)
+        full_grads = []
+
+    for dim in proj_dim:
+        _save(projected_grads, output_dirs)
+
+    torch.cuda.empty_cache()
+    for dim in proj_dim:
+        output_dir = output_dirs[dim]
+        merge_and_normalize_info(output_dir, prefix="grads")
+        merge_info(output_dir, prefix="grads")
+
+    print("Finished")
+
+
+def merge_and_normalize_info(output_dir: str, prefix="reps"):
+    """ Merge and normalize the representations and gradients into a single file. """
+    info = os.listdir(output_dir)
+    info = [file for file in info if file.startswith(prefix)]
+    # Sort the files in ascending order
+    info.sort(key=lambda x: int(x.split(".")[0].split("-")[1]))
+    merged_data = []
+    for file in info:
+        data = torch.load(os.path.join(output_dir, file))
+        normalized_data = normalize(data, dim=1)
+        merged_data.append(normalized_data)
+    merged_data = torch.cat(merged_data, dim=0)
+
+    output_file = os.path.join(output_dir, f"all_orig.pt")
+    torch.save(merged_data, output_file)
+    print(
+        f"Saving the normalized {prefix} (Shape: {merged_data.shape}) to {output_file}.")
+
+
+def merge_info(output_dir: str, prefix="reps"):
+    """ Merge the representations and gradients into a single file without normalization. """
+    info = os.listdir(output_dir)
+    info = [file for file in info if file.startswith(prefix)]
+    # Sort the files in ascending order
+    info.sort(key=lambda x: int(x.split(".")[0].split("-")[1]))
+    merged_data = []
+    for file in info:
+        data = torch.load(os.path.join(output_dir, file))
+        merged_data.append(data)
+    merged_data = torch.cat(merged_data, dim=0)
+
+    output_file = os.path.join(output_dir, f"all_unormalized.pt")
+    torch.save(merged_data, output_file)
+    print(
+        f"Saving the unnormalized {prefix} (Shape: {merged_data.shape}) to {output_file}.")
+
+
+def collect_reps(dataloader: torch.utils.data.DataLoader,
+                 model: torch.nn.Module,
+                 output_dir: str,
+                 max_samples: Optional[int] = None):
+    """
+    Collects representations from a dataloader using a given model and saves them to the output directory.
+
+    Args:
+        dataloader (torch.utils.data.DataLoader): The dataloader containing the input data.
+        model (torch.nn.Module): The model used to compute the representations.
+        output_dir (str): The directory where the representations will be saved.
+        max_samples (int, optional): The maximum number of samples to collect. Defaults to None.
+    """
+
+    all_reps = []
+    count = 0
+    save_interval = 160  # save every 160 batches
+
+    device = next(model.parameters()).device  # only works for single gpu
+    max_index = get_max_saved_index(output_dir, prefix="reps")
+
+    for batch in tqdm(dataloader):
+        count += 1
+        if count <= max_index:
+            print("skipping count", count)
+            continue
+
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        with torch.inference_mode():
+            if isinstance(model, RobertaModel):
+                reps = model(input_ids=input_ids,
+                             attention_mask=attention_mask, output_hidden_states=True, return_dict=True).pooler_output
+            else:
+                hidden_states = model(input_ids,
+                                      labels=input_ids,
+                                      attention_mask=attention_mask,
+                                      output_hidden_states=True).hidden_states
+                ids = torch.arange(len(input_ids), device=input_ids.device)
+                pos = attention_mask.sum(dim=1) - 1
+                reps = hidden_states[-1][ids, pos]
+
+            all_reps.append(reps.cpu())
+            if count % save_interval == 0:
+                all_reps = torch.cat(all_reps)
+                outfile = os.path.join(output_dir, f"reps-{count}.pt")
+                torch.save(all_reps, outfile)
+                all_reps = []
+                print(f"Saving {outfile}")
+
+            if max_samples is not None and count >= max_samples:
+                break
+
+    if len(all_reps) > 0:
+        all_reps = torch.cat(all_reps)
+        outfile = os.path.join(output_dir, f"reps-{count}.pt")
+        torch.save(all_reps, outfile)
+        print(f"Saving {outfile}")
+
+    torch.cuda.empty_cache()
+    merge_and_normalize_info(output_dir, prefix="reps")
+
+    print("Finished")
+
+
+def get_loss(dataloader: torch.utils.data.DataLoader,
+             model: torch.nn.Module,
+             output_dir: str,):
+    """ Get the loss of the model on the given dataset. """
+    total_loss = 0
+    total_tokens = 0
+    for batch in tqdm(dataloader):
+        prepare_batch(batch)
+        num_token = (batch["labels"] != -100).sum()
+        with torch.inference_mode():
+            loss = model(**batch).loss * num_token
+        total_loss += loss.item()
+        total_tokens += num_token.item()
+
+    print(f"Loss: {total_loss / total_tokens}")
+    result = {"num_tokens": total_tokens, "loss": (
+        total_loss / total_tokens)}
+    with open(os.path.join(output_dir, "loss.txt"), "w") as f:
+        f.write(json.dumps(result, indent=4))
