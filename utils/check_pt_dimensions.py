@@ -5,7 +5,7 @@ import glob
 
 
 def check_file_dimension(file_path):
-    print(f"🔍 Checking: {os.path.basename(file_path)} ...")
+    print(f"Checking: {os.path.basename(file_path)} ...")
 
     try:
         data = torch.load(file_path, map_location='cpu')

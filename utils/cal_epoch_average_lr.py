@@ -123,8 +123,6 @@ def main():
     DECIMALS = 2
 
     records = parse_log(LOG_PATH)
-    if not records:
-        raise ValueError("没有解析到记录，检查日志格式/路径。")
 
     discrete_groups = group_by_discrete_epoch(records, decimals=DECIMALS)
     loss_rows = compute_discrete_epoch_loss_stats(discrete_groups)
