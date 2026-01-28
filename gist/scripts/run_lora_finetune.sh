@@ -6,6 +6,4 @@ MODEL_PATH=Qwen/Qwen2.5-1.5B
 JOB_NAME=${MODEL}-less-p${PERCENTAGE}-lora-baseline-${TARGET_TASK_NAME}
 
 
-
-mkdir -p "$WANDB_DIR"
 ./gist/scripts/train/lora_train.sh "$TRAIN_FILES" "$MODEL_PATH" "$JOB_NAME"

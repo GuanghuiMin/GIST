@@ -10,7 +10,6 @@ import datasets
 import torch
 import torch.distributed as dist
 import transformers
-# from instruction_tuning.train.lora_trainer import LoRAFSDPTrainer, Trainer
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, Trainer,
@@ -131,13 +130,6 @@ def main():
                                        tokenizer=tokenizer,
                                        max_length=data_args.max_seq_length)
 
-    # for testing if the model can go through full length
-    # import torch
-    # from datasets import Dataset
-
-    # input_ids = [torch.randint(0, 32000, (2048, )) for _ in range(10000)]
-    # attention_mask = [torch.ones(2048, ) for _ in range(10000)]
-    # train_dataset = Dataset.from_dict({"input_ids": input_ids, "labels": input_ids, "attention_mask": attention_mask})
 
     if dist.is_initialized() and dist.get_rank() == 0:
         print(model)
@@ -156,7 +148,7 @@ def main():
 
     # Training
     train_result = trainer.train()
-    trainer.save_model()  # Saves the tokenizer too for easy upload
+    trainer.save_model()
 
     metrics = train_result.metrics
 
@@ -166,7 +158,6 @@ def main():
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
-    # remove the full model in the end to save space, only adapter is needed
     if isinstance(model, PeftModel):
         pytorch_model_path = os.path.join(
             training_args.output_dir, "pytorch_model_fsdp.bin")
