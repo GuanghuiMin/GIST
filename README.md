@@ -1,6 +1,6 @@
-# GIST: Recovering the Coupled Optimization Geometry for Targeted Instruction Tuning
+# GIST: Targeted Data Selection for Instruction Tuning via Coupled Optimization Geometry
 
-This repository contains the implementation for the paper **"GIST: Recovering the Coupled Optimization Geometry for Targeted Instruction Tuning"**.
+This repository contains the implementation for the paper **"GIST: Targeted Data Selection for Instruction Tuning via Coupled Optimization Geometry"**.
 
 > **Acknowledgement**: This codebase is built upon the [LESS](https://github.com/princeton-nlp/LESS) framework. We sincerely acknowledge the contributors for their excellent open-source work.
 
