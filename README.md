@@ -156,7 +156,3 @@ PERCENTAGE=0.05
 ./eval.sh $TARGET_TASK_NAME "../out/${MODEL}-p${PERCENTAGE}-lora-gist-${TARGET_TASK_NAME}" 0
 
 ```
-
-```
-
-```
