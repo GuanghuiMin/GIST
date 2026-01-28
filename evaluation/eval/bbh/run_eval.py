@@ -53,7 +53,6 @@ def main(args):
     random.seed(42)
 
     all_tasks = {}
-    # === 修复 1: 路径修正，直接在 data_dir 下找 json ===
     task_files = glob.glob(os.path.join(args.data_dir, "*.json"))
     
     if not task_files:
@@ -77,7 +76,6 @@ def main(args):
 
                 all_tasks[task_name] = examples
 
-                # === 修复 3: 安全采样 (解决 Sample larger than population) ===
                 if args.max_num_examples_per_task:
                     num_to_sample = min(len(all_tasks[task_name]), args.max_num_examples_per_task)
                     all_tasks[task_name] = random.sample(all_tasks[task_name], num_to_sample)
