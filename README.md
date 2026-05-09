@@ -156,3 +156,15 @@ PERCENTAGE=0.05
 ./eval.sh $TARGET_TASK_NAME "../out/${MODEL}-p${PERCENTAGE}-lora-gist-${TARGET_TASK_NAME}" 0
 
 ```
+
+## Reference
+
+You find this repo useful, please cite our paper.
+```latex
+@article{min2026gist,
+  title={GIST: Targeted Data Selection for Instruction Tuning via Coupled Optimization Geometry},
+  author={Min, Guanghui and Huang, Tianhao and Wan, Ke and Chen, Chen},
+  journal={arXiv preprint arXiv:2602.18584},
+  year={2026}
+}
+```
