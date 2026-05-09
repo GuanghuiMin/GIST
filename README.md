@@ -159,7 +159,7 @@ PERCENTAGE=0.05
 
 ## Reference
 
-You find this repo useful, please cite our paper.
+If you find this repo useful, please cite our paper.
 ```latex
 @article{min2026gist,
   title={GIST: Targeted Data Selection for Instruction Tuning via Coupled Optimization Geometry},
