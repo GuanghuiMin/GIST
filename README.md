@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 ### Data Preparation
 
-We utilize the same dataset format as LESS. You can find the data [here]().
+We utilize the same dataset format as LESS. You can find the data [here](https://huggingface.co/datasets/princeton-nlp/less_data).
 
 ---
 
