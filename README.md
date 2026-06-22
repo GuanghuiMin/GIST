@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 ### Data Preparation
 
-We utilize the same dataset format as LESS. Please refer to the original project to access the data.
+We utilize the same dataset format as LESS. You can find the data [here]().
 
 ---
 
@@ -123,39 +123,6 @@ python3 -m gist.data_selection.write_selected_data \
 ```
 
 ---
-
-## 📊 Training & Evaluation
-
-### Step 5: Fine-tune with Selected Data
-
-Train the model using the data selected by GIST.
-
-```bash
-TARGET_TASK_NAME="mmlu"
-MODEL="qwen2.5-1.5b"
-PERCENTAGE=0.05
-
-TRAIN_FILES="../gist_results/scores/${MODEL}/${TARGET_TASK_NAME}/top_p${PERCENTAGE}.jsonl"
-MODEL_PATH="Qwen/Qwen2.5-1.5B"
-JOB_NAME="${MODEL}-p${PERCENTAGE}-lora-gist-${TARGET_TASK_NAME}"
-
-./gist/scripts/train/lora_train.sh "$TRAIN_FILES" "$MODEL_PATH" "$JOB_NAME"
-
-```
-
-### Step 6: Evaluation
-
-Evaluate the fine-tuned model on the target task.
-
-```bash
-TARGET_TASK_NAME="mmlu"
-MODEL="qwen2.5-1.5b"
-PERCENTAGE=0.05
-
-# Usage: ./eval.sh <TASK> <CHECKPOINT_PATH> <DEVICE_ID>
-./eval.sh $TARGET_TASK_NAME "../out/${MODEL}-p${PERCENTAGE}-lora-gist-${TARGET_TASK_NAME}" 0
-
-```
 
 ## Reference
 
